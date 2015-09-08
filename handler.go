@@ -28,13 +28,15 @@ import (
 	"strings"
 	"time"
 
-	"appengine"
-	"appengine/memcache"
-	"appengine/user"
+	"google.golang.org/appengine"
+	"google.golang.org/appengine/memcache"
+	"google.golang.org/appengine/user"
+
+	"golang.org/x/net/context"
 )
 
 var templates *template.Template
-var staticFiles map[string][]byte
+var initTime = time.Now()
 
 func init() {
 	templates = template.New("appstats").Funcs(funcs)
@@ -42,16 +44,16 @@ func init() {
 	templates.Parse(htmlMain)
 	templates.Parse(htmlDetails)
 	templates.Parse(htmlFile)
+}
 
-	staticFiles = map[string][]byte{
-		"app_engine_logo_sm.gif": app_engine_logo_sm_gif,
-		"appstats_css.css":       appstats_css_css,
-		"appstats_js.js":         appstats_js_js,
-		"gantt.js":               gantt_js,
-		"minus.gif":              minus_gif,
-		"pix.gif":                pix_gif,
-		"plus.gif":               plus_gif,
+func statsContext(r *http.Request) context.Context {
+	ctx, err := appengine.Namespace(appengine.NewContext(r), Namespace)
+	if err != nil {
+		// NOTE: appengine.Namespace will only return an error if
+		// the passed namespace is invalid.
+		panic(err)
 	}
+	return ctx
 }
 
 func serveError(w http.ResponseWriter, err error) {
@@ -79,7 +81,13 @@ func appstatsHandler(w http.ResponseWriter, r *http.Request) {
 	} else if fileURL == r.URL.Path {
 		file(w, r)
 	} else if strings.HasPrefix(r.URL.Path, staticURL) {
-		static(w, r)
+		name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		content, ok := static[name]
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		http.ServeContent(w, r, name, initTime, content)
 	} else {
 		index(w, r)
 	}
@@ -91,7 +99,7 @@ func index(w http.ResponseWriter, r *http.Request) {
 		keys[i] = fmt.Sprintf(keyPart, i*distance)
 	}
 
-	c := context(r)
+	c := statsContext(r)
 	items, err := memcache.GetMulti(c, keys)
 	if err != nil {
 		return
@@ -99,7 +107,7 @@ func index(w http.ResponseWriter, r *http.Request) {
 
 	ars := allrequestStats{}
 	for _, v := range items {
-		t := stats_part{}
+		t := statsPart{}
 		err := gob.NewDecoder(bytes.NewBuffer(v.Value)).Decode(&t)
 		if err != nil {
 			continue
@@ -109,13 +117,13 @@ func index(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Sort(reverse{ars})
 
-	requestById := make(map[int]*requestStats, len(ars))
+	requestByID := make(map[int]*requestStats, len(ars))
 	idByRequest := make(map[*requestStats]int, len(ars))
 	requests := make(map[int]*statByName)
 	byRequest := make(map[int]map[string]cVal)
 	for i, v := range ars {
 		idx := i + 1
-		requestById[idx] = v
+		requestByID[idx] = v
 		idByRequest[v] = idx
 		requests[idx] = &statByName{
 			RequestStats: v,
@@ -238,7 +246,7 @@ func details(w http.ResponseWriter, r *http.Request) {
 	qtime := roundTime(i)
 	key := fmt.Sprintf(keyFull, qtime)
 
-	c := context(r)
+	c := statsContext(r)
 
 	v := struct {
 		Env             map[string]string
@@ -258,7 +266,7 @@ func details(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	full := stats_full{}
+	full := statsFull{}
 	err = gob.NewDecoder(bytes.NewBuffer(item.Value)).Decode(&full)
 	if err != nil {
 		templates.ExecuteTemplate(w, "details", v)
@@ -306,7 +314,7 @@ func file(w http.ResponseWriter, r *http.Request) {
 	fname := r.URL.Query().Get("f")
 	n := r.URL.Query().Get("n")
 	lineno, _ := strconv.Atoi(n)
-	c := context(r)
+	c := statsContext(r)
 
 	f, err := ioutil.ReadFile(fname)
 	if err != nil {
@@ -334,23 +342,4 @@ func file(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = templates.ExecuteTemplate(w, "file", v)
-}
-
-func static(w http.ResponseWriter, r *http.Request) {
-	fname := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
-	if v, present := staticFiles[fname]; present {
-		h := w.Header()
-
-		if strings.HasSuffix(r.URL.Path, ".css") {
-			h.Set("Content-type", "text/css")
-		} else if strings.HasSuffix(r.URL.Path, ".js") {
-			h.Set("Content-type", "text/javascript")
-		}
-
-		h.Set("Cache-Control", "public, max-age=expiry")
-		expires := time.Now().Add(time.Hour)
-		h.Set("Expires", expires.Format(time.RFC1123))
-
-		w.Write(v)
-	}
 }

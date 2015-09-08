@@ -14,85 +14,150 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+// +build !appengine
+
 package appstats
 
 import (
-	"bytes"
-	"encoding/gob"
-	"fmt"
-	"math/rand"
 	"net/http"
-	"net/url"
-	"runtime/debug"
+	"runtime"
 	"time"
 
-	"appengine"
-	"appengine/memcache"
-	"appengine/user"
-	"appengine_internal"
+	"golang.org/x/net/context"
+
+	"google.golang.org/appengine"
+	"google.golang.org/appengine/log"
+	"google.golang.org/appengine/memcache"
+	"google.golang.org/appengine/user"
+
+	"github.com/golang/protobuf/proto"
 )
 
-var (
-	// RecordFraction is the fraction of requests to record.
-	// Set to a number between 0.0 (none) and 1.0 (all).
-	RecordFraction float64 = 1.0
-
-	// ShouldRecord is the function used to determine if recording will occur
-	// for a given request. The default is to use RecordFraction.
-	ShouldRecord = DefaultShouldRecord
-
-	// ProtoMaxBytes is the amount of protobuf data to record.
-	// Data after this is truncated.
-	ProtoMaxBytes = 150
-
-	// Namespace is the memcache namespace under which to store appstats data.
-	Namespace = "__appstats__"
-)
-
-const (
-	serveURL   = "/_ah/stats/"
-	detailsURL = serveURL + "details"
-	fileURL    = serveURL + "file"
-	staticURL  = serveURL + "static/"
-)
-
-func init() {
-	http.HandleFunc(serveURL, appstatsHandler)
-}
-
-// DefaultShouldRecord will record a request based on RecordFraction.
-func DefaultShouldRecord(r *http.Request) bool {
-	if RecordFraction >= 1.0 {
-		return true
-	}
-
-	return rand.Float64() < RecordFraction
-}
+// Handler is an http.Handler that records RPC statistics if ShouldRecord
+// says so.
+type Handler func(ctx context.Context, w http.ResponseWriter, r *http.Request)
 
 // Context is a timing-aware appengine.Context.
 type Context struct {
-	appengine.Context
-	header http.Header
-	stats  *requestStats
+	context.Context
 }
 
-// Call times an appengine.Context Call. Internal use only.
-func (c Context) Call(service, method string, in, out appengine_internal.ProtoMessage, opts *appengine_internal.CallOptions) error {
-	c.stats.wg.Add(1)
-	defer c.stats.wg.Done()
+func (ctx Context) errorf(format string, a ...interface{}) {
+	log.Errorf(ctx, format, a...)
+}
+
+func (ctx Context) infof(format string, a ...interface{}) {
+	log.Infof(ctx, format, a...)
+}
+
+func (ctx Context) setMulti(items []item) error {
+	var conv []*memcache.Item
+	for _, it := range items {
+		conv = append(conv, &memcache.Item{
+			Key:   it.Key,
+			Value: it.Value,
+		})
+	}
+	return memcache.SetMulti(ctx, conv)
+}
+
+func (ctx Context) stats() *requestStats {
+	return ctx.Value(statsKey).(*requestStats)
+}
+
+func (ctx Context) header() http.Header {
+	return ctx.Value(headerKey).(http.Header)
+}
+
+// URL gives the URL to retrieve stats for ctx.
+func (ctx Context) URL() string {
+	u := requrl(ctx.stats())
+	return u.String()
+}
+
+func appContext(r *http.Request) context.Context {
+	return appengine.NewContext(r)
+}
+
+// NewContext creates a new timing-aware context from r. It wraps
+// appengine.NewContext and then sets up the context for recording
+// statistics.
+func NewContext(r *http.Request) Context {
+	stats := &requestStats{
+		Method: r.Method,
+		Path:   r.URL.Path,
+		Query:  r.URL.RawQuery,
+		Start:  time.Now(),
+	}
+
+	ctx := appengine.NewContext(r)
+
+	if u := user.Current(ctx); u != nil {
+		stats.User = u.String()
+		stats.Admin = u.Admin
+	}
+
+	ctx = context.WithValue(ctx, statsKey, stats)
+	ctx = context.WithValue(ctx, headerKey, r.Header)
+	ctx = appengine.WithAPICallFunc(ctx, appengine.APICallFunc(override))
+
+	return Context{ctx}
+}
+
+// WithContext enables profiling of functions without a corresponding request,
+// as in the google.golang.org/appengine/delay package. method and path may
+// be empty. If ctx is nil, f will be called with nil as argument.
+func WithContext(ctx context.Context, method, path string, f func(context.Context)) {
+	if ctx == nil {
+		f(nil)
+		return
+	}
+
+	stats := &requestStats{
+		Method: method,
+		Path:   path,
+		Start:  time.Now(),
+	}
+
+	if u := user.Current(ctx); u != nil {
+		stats.User = u.String()
+		stats.Admin = u.Admin
+	}
+
+	ctx = context.WithValue(ctx, statsKey, stats)
+	ctx = appengine.WithAPICallFunc(ctx, appengine.APICallFunc(override))
+
+	f(ctx)
+	save(Context{ctx})
+}
+
+func override(ctx context.Context, service, method string, in, out proto.Message) error {
+	stats := ctx.Value(statsKey).(*requestStats)
+
+	stats.wg.Add(1)
+	defer stats.wg.Done()
 
 	if service == "__go__" {
-		return c.Context.Call(service, method, in, out, opts)
+		return appengine.APICall(ctx, service, method, in, out)
 	}
+
+	// NOTE: This limits size of stack traces to 65KiB.
+	b := make([]byte, 65536)
+	i := runtime.Stack(b, false)
 
 	stat := rpcStat{
 		Service:   service,
 		Method:    method,
 		Start:     time.Now(),
-		Offset:    time.Since(c.stats.Start),
-		StackData: string(debug.Stack()),
+		Offset:    time.Since(stats.Start),
+		StackData: string(b[0:i]),
 	}
-	err := c.Context.Call(service, method, in, out, opts)
+
+	// TODO(flowlo): Somehow wrap the actual RPC call. This is
+	// currently not possible, because all the magic is in
+	// google.golang.org/appengine/internal
+	err := appengine.APICall(ctx, service, method, in, out)
+
 	stat.Duration = time.Since(stat.Start)
 	stat.In = in.String()
 	stat.Out = out.String()
@@ -105,188 +170,9 @@ func (c Context) Call(service, method string, in, out appengine_internal.ProtoMe
 		stat.Out = stat.Out[:ProtoMaxBytes] + "..."
 	}
 
-	c.stats.lock.Lock()
-	c.stats.RPCStats = append(c.stats.RPCStats, stat)
-	c.stats.Cost += stat.Cost
-	c.stats.lock.Unlock()
+	stats.lock.Lock()
+	stats.RPCStats = append(stats.RPCStats, stat)
+	stats.Cost += stat.Cost
+	stats.lock.Unlock()
 	return err
-}
-
-// NewContext creates a new timing-aware context from req.
-func NewContext(req *http.Request) Context {
-	c := appengine.NewContext(req)
-	var uname string
-	var admin bool
-	if u := user.Current(c); u != nil {
-		uname = u.String()
-		admin = u.Admin
-	}
-	return Context{
-		Context: c,
-		header:  req.Header,
-		stats: &requestStats{
-			User:   uname,
-			Admin:  admin,
-			Method: req.Method,
-			Path:   req.URL.Path,
-			Query:  req.URL.RawQuery,
-			Start:  time.Now(),
-		},
-	}
-}
-
-// WithContext enables profiling of functions without a corresponding request,
-// as in the appengine/delay package. method and path may be empty.
-func WithContext(context appengine.Context, method, path string, f func(Context)) {
-	var uname string
-	var admin bool
-	if u := user.Current(context); u != nil {
-		uname = u.String()
-		admin = u.Admin
-	}
-	c := Context{
-		Context: context,
-		stats: &requestStats{
-			User:   uname,
-			Admin:  admin,
-			Method: method,
-			Path:   path,
-			Start:  time.Now(),
-		},
-	}
-	f(c)
-	c.save()
-}
-
-const bufMaxLen = 1000000
-
-func (c Context) save() {
-	c.stats.wg.Wait()
-	c.stats.Duration = time.Since(c.stats.Start)
-
-	var buf_part, buf_full bytes.Buffer
-	full := stats_full{
-		Header: c.header,
-		Stats:  c.stats,
-	}
-	if err := gob.NewEncoder(&buf_full).Encode(&full); err != nil {
-		c.Errorf("appstats Save error: %v", err)
-		return
-	} else if buf_full.Len() > bufMaxLen {
-		// first try clearing stack traces
-		for i := range full.Stats.RPCStats {
-			full.Stats.RPCStats[i].StackData = ""
-		}
-		buf_full.Truncate(0)
-		gob.NewEncoder(&buf_full).Encode(&full)
-	}
-	part := stats_part(*c.stats)
-	for i := range part.RPCStats {
-		part.RPCStats[i].StackData = ""
-		part.RPCStats[i].In = ""
-		part.RPCStats[i].Out = ""
-	}
-	if err := gob.NewEncoder(&buf_part).Encode(&part); err != nil {
-		c.Errorf("appstats Save error: %v", err)
-		return
-	}
-
-	item_part := &memcache.Item{
-		Key:   c.stats.PartKey(),
-		Value: buf_part.Bytes(),
-	}
-
-	item_full := &memcache.Item{
-		Key:   c.stats.FullKey(),
-		Value: buf_full.Bytes(),
-	}
-
-	c.Infof("Saved; %s: %s, %s: %s, link: %v",
-		item_part.Key,
-		byteSize(len(item_part.Value)),
-		item_full.Key,
-		byteSize(len(item_full.Value)),
-		c.URL(),
-	)
-
-	nc := c.storeContext()
-	memcache.SetMulti(nc, []*memcache.Item{item_part, item_full})
-}
-
-// URL returns the appstats URL for the current request.
-func (c Context) URL() string {
-	u := url.URL{
-		Path:     detailsURL,
-		RawQuery: fmt.Sprintf("time=%v", c.stats.Start.Nanosecond()),
-	}
-	return u.String()
-}
-
-func (c Context) storeContext() appengine.Context {
-	nc, _ := appengine.Namespace(c.Context, Namespace)
-	return nc
-}
-
-func context(r *http.Request) appengine.Context {
-	c := appengine.NewContext(r)
-	nc, _ := appengine.Namespace(c, Namespace)
-	return nc
-}
-
-// handler is an http.Handler that records RPC statistics.
-type handler struct {
-	f func(appengine.Context, http.ResponseWriter, *http.Request)
-}
-
-// NewHandler returns a new Handler that will execute f.
-func NewHandler(f func(appengine.Context, http.ResponseWriter, *http.Request)) http.Handler {
-	return handler{
-		f: f,
-	}
-}
-
-// NewHandlerFunc returns a new HandlerFunc that will execute f.
-func NewHandlerFunc(f func(appengine.Context, http.ResponseWriter, *http.Request)) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		h := handler{
-			f: f,
-		}
-		h.ServeHTTP(w, r)
-	}
-}
-
-type responseWriter struct {
-	http.ResponseWriter
-
-	c Context
-}
-
-func (r responseWriter) Write(b []byte) (int, error) {
-	// Emulate the behavior of http.ResponseWriter.Write since it doesn't
-	// call our WriteHeader implementation.
-	if r.c.stats.Status == 0 {
-		r.WriteHeader(http.StatusOK)
-	}
-
-	return r.ResponseWriter.Write(b)
-}
-
-func (r responseWriter) WriteHeader(i int) {
-	r.c.stats.Status = i
-	r.ResponseWriter.WriteHeader(i)
-}
-
-func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if ShouldRecord(r) {
-		c := NewContext(r)
-		rw := responseWriter{
-			ResponseWriter: w,
-			c:              c,
-		}
-		h.f(c, rw, r)
-		c.save()
-	} else {
-		c := appengine.NewContext(r)
-		h.f(c, w, r)
-	}
 }

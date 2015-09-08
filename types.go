@@ -49,9 +49,9 @@ type requestStats struct {
 	wg   sync.WaitGroup
 }
 
-type stats_part requestStats
+type statsPart requestStats
 
-type stats_full struct {
+type statsFull struct {
 	Header http.Header
 	Stats  *requestStats
 }
