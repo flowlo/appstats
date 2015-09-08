@@ -6,13 +6,13 @@ import (
 	"github.com/golang/protobuf/proto"
 )
 
-const (
-	cost_Write = 10
-	cost_Read  = 7
-	cost_Small = 1
-)
+var cost = struct {
+	Read, Write, Small int64
+}{
+	7, 10, 1,
+}
 
-// todo: implement read and small ops costs
+// TODO: Implement read and small ops costs.
 
 func getCost(p proto.Message) int64 {
 	v := reflect.ValueOf(p)
@@ -21,10 +21,7 @@ func getCost(p proto.Message) int64 {
 		return 0
 	}
 
-	var cost int64
-	cost += extractCost(v)
-
-	return cost
+	return extractCost(v)
 }
 
 func extractCost(v reflect.Value) int64 {
@@ -36,8 +33,6 @@ func extractCost(v reflect.Value) int64 {
 	if v.Kind() != reflect.Struct {
 		return 0
 	}
-
-	var cost int64
 
 	extract := func(name string) int64 {
 		w := v.FieldByName(name)
@@ -53,8 +48,5 @@ func extractCost(v reflect.Value) int64 {
 		return 0
 	}
 
-	cost += extract("IndexWrites")
-	cost += extract("EntityWrites")
-
-	return cost * cost_Write
+	return (extract("IndexWrites") + extract("EntityWrites")) * cost.Write
 }

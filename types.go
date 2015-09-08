@@ -49,9 +49,9 @@ type requestStats struct {
 	wg   sync.WaitGroup
 }
 
-type stats_part requestStats
+type statsPart requestStats
 
-type stats_full struct {
+type statsFull struct {
 	Header http.Header
 	Stats  *requestStats
 }
@@ -93,35 +93,41 @@ func (r rpcStat) Response() string {
 }
 
 func (r rpcStat) Stack() stack {
-	s := stack{}
-
-	if r.StackData == "" {
-		return s
-	}
-
 	lines := strings.Split(r.StackData, "\n")
-	for i := 0; i < len(lines); i++ {
-		idx := strings.LastIndex(lines[i], " ")
-		if idx == -1 {
-			break
-		}
-
-		cidx := strings.LastIndex(lines[i], ":")
-		lineno, _ := strconv.Atoi(lines[i][cidx+1 : idx])
-		f := &frame{
-			Location: lines[i][:cidx],
-			Lineno:   lineno,
-		}
-
-		if i+1 < len(lines) && strings.HasPrefix(lines[i+1], "\t") {
-			f.Call = strings.TrimSpace(lines[i+1])
-			i++
-		}
-
-		s = append(s, f)
+	if len(lines) < 7 || len(lines)%2 != 0 {
+		return stack{}
 	}
 
-	return s[2:]
+	// First line contains goroutine index and state,
+	// something like "goroutine 1337 [...]:". This is skipped.
+	lines = lines[1:]
+
+	// Also, cut the next two entries, as they will be the calls to
+	// appengine.APICall and appstats.override every time.
+	lines = lines[4:]
+
+	frames := make([]*frame, 0, len(lines)/2)
+
+	for i := 0; i+1 < len(lines); i += 2 {
+		// Lines come in pairs, first the function
+		// name of the frame with it's arguments, ...
+		f := &frame{Call: lines[i]}
+
+		i++
+
+		idx := strings.LastIndex(lines[i], " ")
+		cidx := strings.LastIndex(lines[i], ":")
+		if idx == -1 || cidx == -1 {
+			continue
+		}
+
+		f.Location = lines[i][1:cidx]
+		f.Lineno, _ = strconv.Atoi(lines[i][cidx:idx])
+
+		frames = append(frames, f)
+	}
+
+	return frames
 }
 
 type stack []*frame
