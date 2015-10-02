@@ -36,7 +36,7 @@ import (
 )
 
 var templates *template.Template
-var staticFiles map[string][]byte
+var initTime = time.Now()
 
 func init() {
 	templates = template.New("appstats").Funcs(funcs)
@@ -44,16 +44,6 @@ func init() {
 	templates.Parse(htmlMain)
 	templates.Parse(htmlDetails)
 	templates.Parse(htmlFile)
-
-	staticFiles = map[string][]byte{
-		"app_engine_logo_sm.gif": app_engine_logo_sm_gif,
-		"appstats_css.css":       appstats_css_css,
-		"appstats_js.js":         appstats_js_js,
-		"gantt.js":               gantt_js,
-		"minus.gif":              minus_gif,
-		"pix.gif":                pix_gif,
-		"plus.gif":               plus_gif,
-	}
 }
 
 func serveError(w http.ResponseWriter, err error) {
@@ -81,7 +71,13 @@ func appstatsHandler(w http.ResponseWriter, r *http.Request) {
 	} else if fileURL == r.URL.Path {
 		file(c, w, r)
 	} else if strings.HasPrefix(r.URL.Path, staticURL) {
-		static(w, r)
+		name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		content, ok := static[name]
+		if !ok {
+			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			return
+		}
+		http.ServeContent(w, r, name, initTime, content)
 	} else {
 		index(c, w, r)
 	}
@@ -110,13 +106,13 @@ func index(c context.Context, w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Sort(reverse{ars})
 
-	requestById := make(map[int]*requestStats, len(ars))
+	requestByID := make(map[int]*requestStats, len(ars))
 	idByRequest := make(map[*requestStats]int, len(ars))
 	requests := make(map[int]*statByName)
 	byRequest := make(map[int]map[string]cVal)
 	for i, v := range ars {
 		idx := i + 1
-		requestById[idx] = v
+		requestByID[idx] = v
 		idByRequest[v] = idx
 		requests[idx] = &statByName{
 			RequestStats: v,
@@ -332,23 +328,4 @@ func file(c context.Context, w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = templates.ExecuteTemplate(w, "file", v)
-}
-
-func static(w http.ResponseWriter, r *http.Request) {
-	fname := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
-	if v, present := staticFiles[fname]; present {
-		h := w.Header()
-
-		if strings.HasSuffix(r.URL.Path, ".css") {
-			h.Set("Content-type", "text/css")
-		} else if strings.HasSuffix(r.URL.Path, ".js") {
-			h.Set("Content-type", "text/javascript")
-		}
-
-		h.Set("Cache-Control", "public, max-age=expiry")
-		expires := time.Now().Add(time.Hour)
-		h.Set("Expires", expires.Format(time.RFC1123))
-
-		w.Write(v)
-	}
 }
