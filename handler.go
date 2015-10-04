@@ -77,6 +77,7 @@ func appstatsHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
+		w.Header().Set("ETag", fmt.Sprintf(`"%x"`, content.Sum))
 		http.ServeContent(w, r, name, initTime, content)
 	} else {
 		index(c, w, r)

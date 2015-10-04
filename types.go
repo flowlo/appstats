@@ -17,7 +17,10 @@
 package appstats
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -166,4 +169,21 @@ type skey struct {
 type cVal struct {
 	count int
 	cost  int64
+}
+
+type resource struct {
+	*bytes.Reader
+	Sum [sha256.Size]byte
+}
+
+func newResource(data []byte) resource {
+	r := resource{
+		Reader: bytes.NewReader(data),
+		Sum:    [sha256.Size]byte{},
+	}
+	h := sha256.New()
+	io.Copy(h, r)
+	h.Sum(r.Sum[:])
+	r.Seek(0, 0)
+	return r
 }
